@@ -120,7 +120,7 @@ def normalize_advantages(advantages: List[torch.Tensor], ctx: AdvantageContext) 
 
 # Estimators that normalize rewards within a prompt group; only these need the
 # rollout-reward merge (one reward per rollout, grouped by prompt). reinforce / gae /
-# on_policy_distill score each sample independently, so in multi-turn rollouts that
+# on_policy_distill / sdpo score each sample independently, so in multi-turn rollouts that
 # split one trajectory into several samples they must NOT merge (see compute_advantages).
 GROUP_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "dr_grpo", "reinforce_baseline", "rloo"})
 
@@ -179,6 +179,26 @@ def on_policy_distill(
     pulled onto the teacher on its *own* on-policy samples. Point the teacher at a (bigger)
     checkpoint with ``--ref.model_name_or_path`` and set the strength with ``--algo.kl.init_coef``;
     keep ``--algo.kl.use_loss`` off so the KL flows through the advantage, not a separate loss term.
+    """
+    returns = [(-ctx.kl_coef * kl) * mask for kl, mask in zip(ctx.kls, ctx.action_masks)]
+    return [ret.clone() for ret in returns], returns
+
+
+@register_advantage_estimator("sdpo")
+def sdpo(
+    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """SDPO (https://arxiv.org/abs/2601.20802): RL via self-distillation.
+
+    The dense per-token signal is distillation toward a *self-teacher*: the reference model
+    re-scoring the SAME response after a reprompt that shows a successful rollout from the
+    sample's own prompt group (built in ``experience_maker``, which also zeroes ``kl`` for
+    samples whose group never succeeded and clamps it to ±``--algo.sdpo.adv_clip``). With
+    ``--algo.kl.estimator k1`` each ``ctx.kls`` entry is ``log pi_old - log q_teacher``, so the
+    advantage is ``kl_coef * (log q_teacher - log pi_old)`` — positive exactly where the
+    solution-informed teacher is more confident in the sampled token than the student was.
+    Same estimator shape as ``on_policy_distill``; the reprompted teacher context is what
+    makes it SDPO. No scalar task reward, no group baseline, no whitening.
     """
     returns = [(-ctx.kl_coef * kl) * mask for kl, mask in zip(ctx.kls, ctx.action_masks)]
     return [ret.clone() for ret in returns], returns

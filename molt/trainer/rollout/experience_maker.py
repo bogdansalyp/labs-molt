@@ -38,6 +38,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# SDPO self-teacher reprompt (https://arxiv.org/abs/2601.20802, Table 2). Prepended as plain
+# text BEFORE the sample's rendered token sequence: the pipeline only sees rendered token ids
+# (no message structure), and a prefix keeps both the original chat markup and the response
+# token-exact while still putting the solution in the teacher's context.
+SDPO_TEACHER_PREFIX = (
+    "A correct solution to the question asked below:\n\n{solution}\n\n"
+    "Use it to correctly solve the question.\n\n"
+)
+
 
 def rollout_and_group_ids(experience):
     """Per-sample rollout and prompt-group ids, with the fallbacks the pipeline shares.
@@ -89,6 +98,9 @@ class RemoteExperienceMaker:
         base_action_log_probs (KL recipes), old action_log_probs, and the per-token kl, ready for
         advantage estimation."""
         args = self.args
+        sdpo = self.advantage_estimator == "sdpo"
+        if sdpo:
+            self._build_sdpo_teacher_inputs(experiences)
         if self.critic_model_group is not None:
             self._dispatch_forward(experiences, self.critic_model_group, "values")
         if self.initial_model_group is not None:
@@ -121,6 +133,19 @@ class RemoteExperienceMaker:
             else:
                 experience.kl = torch.zeros_like(experience.action_mask, dtype=torch.float32)
                 logprobs_diff = torch.zeros_like(experience.action_mask, dtype=torch.float32)
+            if sdpo:
+                # kl is the student->self-teacher log-ratio, i.e. the (negated) SDPO advantage.
+                # It only carries signal under a real reprompt, so zero it for teacherless
+                # samples and clamp the rest (the paper's advantage clip). Teacher tensors are
+                # consumed; clear them so replay-buffer batching never sees mixed lengths.
+                clip = args.algo.sdpo.adv_clip
+                if experience.teacher_sequences is None:
+                    experience.kl = torch.zeros_like(experience.kl)
+                elif clip:
+                    experience.kl = experience.kl.clamp(min=-clip, max=clip)
+                experience.info["sdpo_teacher"] = torch.tensor([float(experience.teacher_sequences is not None)])
+                experience.teacher_sequences = None
+                experience.teacher_attention_mask = None
             experience.info["kl"] = masked_mean(experience.kl, experience.action_mask, dim=-1)
             experience.info["logprobs_diff"] = masked_mean(logprobs_diff, experience.action_mask, dim=-1)
             # With KL as a reward (or no ref) the loss needs no separate KL term, so drop the ref
@@ -128,6 +153,50 @@ class RemoteExperienceMaker:
             if not args.algo.kl.use_loss:
                 experience.base_action_log_probs = None
         return experiences
+
+    def _build_sdpo_teacher_inputs(self, experiences: List[Experience]) -> None:
+        """Attach the SDPO self-teacher context (https://arxiv.org/abs/2601.20802): for every
+        sample whose prompt group produced a successful rollout (reward >= sdpo.success_threshold),
+        prepend that solution as a plain-text prefix to the sample's own token sequence. A
+        successful sample teaches itself (paper Table 2); a failed one learns from its group's
+        first success; a sample in a never-successful group keeps teacher_sequences=None and gets
+        a zero SDPO advantage in make_experience. Token ids are read via a transient object-store
+        fetch (heavy_ref stays set, so the forward workers still reload from the runners)."""
+        heavy_refs = {i: e.heavy_ref for i, e in enumerate(experiences) if e.heavy_ref is not None}
+        fetched = dict(zip(heavy_refs, ray.get(list(heavy_refs.values())))) if heavy_refs else {}
+
+        def seq_of(i: int) -> torch.Tensor:  # (T,) token ids of sample i
+            return (fetched[i]["sequences"] if i in fetched else experiences[i].sequences)[0]
+
+        def response_text(i: int) -> str:  # decoded generated (action) tokens of sample i
+            mask = experiences[i].action_mask[0].bool()
+            return self.tokenizer.decode(seq_of(i)[1:][mask], skip_special_tokens=True).strip()
+
+        successful = [
+            e.rewards is not None and float(e.rewards[0]) >= self.args.algo.sdpo.success_threshold
+            for e in experiences
+        ]
+        first_success: dict = {}  # prompt group id -> index of its first successful rollout
+        for i, exp in enumerate(experiences):
+            if successful[i] and exp.group_ids and exp.group_ids[0] not in first_success:
+                first_success[exp.group_ids[0]] = i
+
+        bos = self.tokenizer.bos_token_id
+        for i, exp in enumerate(experiences):
+            j = i if successful[i] else first_success.get(exp.group_ids[0] if exp.group_ids else None)
+            if j is None:
+                continue
+            prefix = self.tokenizer(
+                SDPO_TEACHER_PREFIX.format(solution=response_text(j)),
+                add_special_tokens=False,
+                return_tensors="pt",
+            ).input_ids
+            seq = seq_of(i).unsqueeze(0)
+            # Insert the prefix after a leading BOS (when the model uses one) so the teacher
+            # sequence stays well-formed.
+            k = 1 if bos is not None and seq[0, 0].item() == bos else 0
+            exp.teacher_sequences = torch.cat([seq[:, :k], prefix.to(seq.dtype), seq[:, k:]], dim=1)
+            exp.teacher_attention_mask = torch.ones_like(exp.teacher_sequences)
 
     def _dispatch_forward(self, experiences: List[Experience], group: "RayActorGroup", result_attr: str) -> None:
         """Run ``group``'s forward on every sample — distributed across its DP ranks, each reloading its

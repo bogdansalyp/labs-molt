@@ -434,10 +434,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--algo.advantage.estimator",
         type=str,
-        choices=["reinforce", "rloo", "reinforce_baseline", "grpo", "dr_grpo", "on_policy_distill", "gae"],
+        choices=["reinforce", "rloo", "reinforce_baseline", "grpo", "dr_grpo", "on_policy_distill", "sdpo", "gae"],
         default="reinforce",
         help="Advantage estimation method: reinforce, rloo, reinforce_baseline, grpo, dr_grpo, "
-        "on_policy_distill (per-token reverse KL to the --ref.model_name_or_path teacher), or gae "
+        "on_policy_distill (per-token reverse KL to the --ref.model_name_or_path teacher), "
+        "sdpo (https://arxiv.org/abs/2601.20802 — self-distillation toward the reference model "
+        "re-scoring each response after a reprompt showing a successful rollout from the same "
+        "prompt group; see --algo.sdpo.*), or gae "
         "(PPO value baseline — builds a colocated critic; see --critic.*)",
     )
     parser.add_argument("--algo.advantage.gamma", type=float, default=1, help="discount factor")
@@ -455,6 +458,19 @@ if __name__ == "__main__":
         "Affects the whitening estimators (reinforce / reinforce_baseline / gae); for a no-std GRPO "
         "use --algo.advantage.estimator dr_grpo. Useful in single-rollout / async where the batch "
         "mean/std couple samples and are a noisy moving target.",
+    )
+    parser.add_argument(
+        "--algo.sdpo.success_threshold",
+        type=float,
+        default=1.0,
+        help="SDPO: a rollout with reward >= this counts as a 'solution' its prompt group's "
+        "self-teacher reprompts distill from.",
+    )
+    parser.add_argument(
+        "--algo.sdpo.adv_clip",
+        type=float,
+        default=5.0,
+        help="SDPO: clamp the per-token teacher/student log-ratio advantage to ±this (0 disables).",
     )
     # Train/rollout (FSDP-actor vs vLLM) logprob-mismatch importance-sampling correction.
     parser.add_argument(
@@ -923,7 +939,24 @@ if __name__ == "__main__":
 
             args.train.agent_path = distill_agent.__file__
 
-    # Standard KL-to-init RL default (on_policy_distill set its own coefficient above).
+    if args.algo.advantage.estimator == "sdpo":
+        # SDPO (https://arxiv.org/abs/2601.20802) is a single switch: the reference model is the
+        # frozen self-teacher (the paper's regularized-teacher ablation) that re-scores each
+        # response after a reprompt built from a successful rollout of the same prompt group, and
+        # the per-token distillation log-ratio is the whole advantage — so the KL plumbing is
+        # derived here exactly like on_policy_distill. --ref.model_name_or_path defaults to the
+        # actor checkpoint (self-teaching); point it elsewhere for an external teacher.
+        args.algo.kl.estimator = "k1"  # ctx.kls = log pi_old - log q_teacher (the SDPO advantage)
+        args.algo.kl.use_loss = False  # the signal flows through the advantage, not a loss term
+        if args.algo.kl.init_coef is None:
+            args.algo.kl.init_coef = 1.0  # advantage scale; > 0 also enables the reference group
+        if args.algo.kl.init_coef <= 0:
+            raise ValueError(
+                "sdpo requires --algo.kl.init_coef > 0: it scales the distillation advantage and "
+                "a positive value is what instantiates the self-teacher reference model."
+            )
+
+    # Standard KL-to-init RL default (on_policy_distill / sdpo set their own coefficient above).
     if args.algo.kl.init_coef is None:
         args.algo.kl.init_coef = 0.01
 
@@ -936,9 +969,16 @@ if __name__ == "__main__":
         args.rollout.vllm_generate_batch_size = args.rollout.batch_size
 
     # --- Algorithm checks ---
-    # Group-relative estimators need >1 sample per prompt to form a baseline during training;
-    # eval-only never trains, so skip that gate (eval uses --eval.n_samples_per_prompt).
-    if not args.eval.eval_only and args.algo.advantage.estimator in ["rloo", "reinforce_baseline", "grpo", "dr_grpo"]:
+    # Group-relative estimators need >1 sample per prompt to form a baseline during training
+    # (sdpo: to find a successful group rollout to reprompt with); eval-only never trains, so
+    # skip that gate (eval uses --eval.n_samples_per_prompt).
+    if not args.eval.eval_only and args.algo.advantage.estimator in [
+        "rloo",
+        "reinforce_baseline",
+        "grpo",
+        "dr_grpo",
+        "sdpo",
+    ]:
         assert args.rollout.n_samples_per_prompt > 1, (
             f"{args.algo.advantage.estimator} requires n_samples_per_prompt > 1"
         )

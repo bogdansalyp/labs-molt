@@ -161,11 +161,18 @@ class ReferenceModelActor(BaseModelActor):
 
             mm_inputs = merge_mm_train_inputs(experience.mm_train_inputs, device)
 
+        sequences, attention_mask = experience.sequences, experience.attention_mask
+        if experience.teacher_sequences is not None:
+            # SDPO self-teacher: re-score the same response under the feedback reprompt. The
+            # teacher sequence is the original one with a prefix prepended, and Actor.forward
+            # takes the LAST action_mask-width log-probs, so the student's action_mask aligns
+            # unchanged and the result stays on the student's step axis.
+            sequences, attention_mask = experience.teacher_sequences, experience.teacher_attention_mask
         with torch.no_grad():
             output = self.model(
-                experience.sequences.to(device),
+                sequences.to(device),
                 experience.action_mask.to(device),
-                experience.attention_mask.to(device),
+                attention_mask.to(device),
                 **mm_inputs,
             )
         return output["action_log_probs"].to("cpu")

@@ -125,6 +125,13 @@ class Experience:
     group_ids: list[str] = field(default_factory=list)
     rollout_ids: list[str] = field(default_factory=list)
 
+    # SDPO self-teacher context (--algo.advantage.estimator sdpo): the reprompted sequence
+    # (feedback prefix + sequences) the reference model re-scores the response under.
+    # Transient: set and cleared inside make_experience, so it never reaches replay-buffer
+    # batching — deliberately NOT a tensor_field, so batching fails loudly if it leaks.
+    teacher_sequences: torch.Tensor = None  # (B, T' >= T) token ids
+    teacher_attention_mask: torch.Tensor = None  # (B, T')
+
     # Distributed rollout: when set, the heavy tensors below (HEAVY_FIELDS) live in the object
     # store — produced and kept on the runner that generated the sample — and this holds the ref
     # to them. The lightweight fields (masks, rewards, ids, info) stay in place, so the controller

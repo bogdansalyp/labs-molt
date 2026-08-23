@@ -136,9 +136,10 @@ RL on vLLM. Read every line that touches your gradients, in plain PyTorch.
 
 | Area | Support |
 |---|---|
-| Estimators | `reinforce`, `reinforce_baseline`, `rloo`, `grpo`, `dr_grpo`, `gae` (PPO), `on_policy_distill` |
+| Estimators | `reinforce`, `reinforce_baseline`, `rloo`, `grpo`, `dr_grpo`, `gae` (PPO), `on_policy_distill`, `sdpo` |
 | PPO critic | `--algo.advantage.estimator gae` adds a value model: its own Ray group (`CriticModelActor`), colocated on the actor's GPUs by default or disaggregatable, GAE advantages (`--algo.advantage.lam`) + clipped value loss (`--critic.value_clip`), own optimizer/LR (`--critic.adam.lr`) and resumable `_critic` checkpoint. Built on `NeMoAutoModelForCausalLM` + a scalar value head, so it keeps the native TP / EP / CP path |
 | Distillation | On-policy distillation — per-token reverse KL to a frozen teacher, via `--algo.advantage.estimator on_policy_distill` + `--ref.model_name_or_path` |
+| Self-distillation | SDPO ([arXiv:2601.20802](https://arxiv.org/abs/2601.20802)) — each response is re-scored by the reference model after a reprompt showing a successful rollout from the same prompt group, and the per-token teacher/student log-ratio becomes the advantage; `--algo.advantage.estimator sdpo` (+ optional `--algo.sdpo.success_threshold`, `--algo.sdpo.adv_clip`) |
 | IS correction | Train/rollout logprob-mismatch correction for off-policy / async rollout: `is_correction_level {off,token,seq,geo}` × `is_correction_mode {mask,clip,trunc}` (covers TIS, IcePop, seq-mask-tis; see *IS correction* below) |
 | KL | Optional reference workers when `--algo.kl.init_coef > 0` (the reference doubles as the distillation teacher) |
 
@@ -267,6 +268,7 @@ Common RL switches:
 | Correct async rollout logprobs | `--algo.advantage.is_correction_level geo` (seq-mask-tis; token-level adds `--algo.advantage.is_correction_mode clip/trunc/mask`) |
 | Freeze MoE routing (stabilize MoE RL) | `--actor.freeze_moe_router` |
 | On-policy distillation | `--algo.advantage.estimator on_policy_distill --ref.model_name_or_path /path/to/teacher` |
+| Self-distillation (SDPO) | `--algo.advantage.estimator sdpo --rollout.n_samples_per_prompt 8` — the reference workers (defaulting to the actor checkpoint) act as the self-teacher |
 | Independent eval sampling | `--eval.temperature`, `--eval.top_p`, `--eval.max_new_tokens`, `--eval.n_samples_per_prompt` (unset ones fall back to rollout) |
 | Eval a checkpoint (no training) | `--eval.eval_only --eval.dataset <path>` — score the eval set once and exit; vLLM holds the HF weights, so the policy/ref/critic FSDP actors are never built and their GPUs go to the eval |
 | Dump / replay a rollout batch | `--train.rollout_dump_dir <dir>` then `--train.rollout_replay_dir <dir>` re-runs training on it without regenerating |
